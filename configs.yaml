@@ -1,0 +1,32 @@
+dataset: "Parkinson Voice Dataset"
+train_file: "/path/to/train.csv"
+eval_file: "/path/to/val.csv"
+audio_directory: "/path/to/audio_files"
+sample_rate: 16000
+num_samples: 16000
+batch_size: 8
+num_workers: 4
+learning_rate: 0.00003
+weight_decay: 0.01
+max_epochs: 50
+augment: true
+aug_params:
+  noise:
+    min: 0.001
+    max: 0.01
+    p: 0.5
+  low_pass:
+    min: 3000
+    max: 6000
+    p: 0.3
+  time_stretch:
+    min: 0.9
+    max: 1.1
+    p: 0.3
+  pitch_shift:
+    min: -2
+    max: 2
+    p: 0.3
+model_checkpoint: "microsoft/wavlm-base-plus"
+output_dir: "/path/to/results"
+precision: "16-mixed"
