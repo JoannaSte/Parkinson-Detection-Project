@@ -1,138 +1,130 @@
+import math
 import os
-import torch
-import torchaudio
+import random
+import librosa
 import pandas as pd
-import numpy as np
+import torch
 from torch.utils.data import Dataset
-from audiomentations import (
-    LowPassFilter,
-    AddGaussianNoise,
-    TimeStretch,
-    PitchShift,
-)
+from transformers import AutoFeatureExtractor
 
-class MyOwnData(Dataset):
-    def __init__(
-        self,
-        annotations_file: str,
-        audio_dir: str,
-        target_sample_rate: int,
-        num_samples: int,
-        device: str = "cpu",
-        augment: bool = False,
-        aug_params: dict | None = None,
-    ):
-        self.audio_dir = audio_dir
-        self.annotations = pd.read_csv(annotations_file)
 
+class LiderDatasetChunked(Dataset):
+    def __init__(self,
+                 audio_dir_file,
+                 annotations_file,
+                 task_number,
+                 target_sample_rate,
+                 num_samples,
+                 device,
+                 fold,
+                 eval_or_train,
+                 processor,
+                 overlap=0.0,
+                 chunk_index=None,
+                 skip_too_short=True):
+        """
+        chunk_index:
+            None  -> wszystkie chunki z każdego nagrania (jak wcześniej)
+            int   -> tylko ten konkretny chunk (0 = 0-2s, 1 = 2-4s, ...)
+                     wspiera negatywne indeksy (-1 = ostatni chunk)
+        skip_too_short:
+            True  -> pomija nagrania zbyt krótkie na żądany chunk
+            False -> dodaje chunk z paddingiem zerami
+        """
+        self.audio_dir_file = audio_dir_file
+        self.device = device
         self.target_sample_rate = target_sample_rate
         self.num_samples = num_samples
-        self.device = device
+        self.length_sec = num_samples / target_sample_rate
+        self.overlap = overlap
+        self.chunk_index = chunk_index
+        self.skip_too_short = skip_too_short
 
-        self.augment = augment
-        self.aug_params = aug_params or {}
+        # Wczytaj i przefiltruj anotacje
+        annotations = pd.read_csv(annotations_file)
+        annotations = annotations[annotations['experiment_number'] == task_number]
+        if eval_or_train == 'eval':
+            annotations = annotations[annotations['fold'] == fold]
+        else:
+            annotations = annotations[annotations['fold'] != fold]
+        self.annotations = annotations.reset_index(drop=True)
+
+        # Procesor ładowany RAZ
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(processor)
+
+        # Wygeneruj indeks chunków
+        self.chunks = self._build_chunk_index()
+
+    def _build_chunk_index(self):
+        """Buduje listę [(row_idx, start_sec), ...] zależnie od chunk_index."""
+        chunks = []
+        step_sec = self.length_sec * (1 - self.overlap)
+
+        for idx, row in self.annotations.iterrows():
+            duration = row['duration']
+
+            # Wszystkie możliwe chunki dla tego nagrania
+            if duration <= self.length_sec:
+                all_starts = [0.0]
+            else:
+                n_chunks = int(math.floor((duration - self.length_sec) / step_sec)) + 1
+                all_starts = [i * step_sec for i in range(n_chunks)]
+
+            # Wybór: wszystkie czy konkretny chunk?
+            if self.chunk_index is None:
+                # Wszystkie chunki
+                for start in all_starts:
+                    chunks.append((idx, start))
+            else:
+                # Konkretny chunk
+                try:
+                    chosen_start = all_starts[self.chunk_index]
+                    chunks.append((idx, chosen_start))
+                except IndexError:
+                    # Nagranie za krótkie na żądany chunk
+                    if self.skip_too_short:
+                        continue  # pomijamy
+                    else:
+                        # Padding: bierzemy start = 0 i tak, że i tak będzie zerami dopełnione
+                        chunks.append((idx, 0.0))
+
+        return chunks
 
     def __len__(self):
-        return len(self.annotations)
+        return len(self.chunks)
 
     def __getitem__(self, index):
-        row = self.annotations.iloc[index]
+        row_idx, start_sec = self.chunks[index]
+        row = self.annotations.iloc[row_idx]
 
-        audio_path = self._get_audio_sample_path(row)
-        label = row["label"]
-        sample_id = self._get_id(row)
+        audio_path = self._get_audio_path(row)
+        signal, _ = librosa.load(audio_path, sr=self.target_sample_rate)
 
-        signal, sr = torchaudio.load(audio_path)
+        processed = self.feature_extractor(
+            signal, sampling_rate=self.target_sample_rate, return_tensors="pt"
+        )
+        signal = processed['input_values'][0]
 
-        signal = self._resample(signal, sr)
-        signal = self._trim_or_pad(signal)
+        start = int(start_sec * self.target_sample_rate)
+        stop = start + self.num_samples
+        signal = signal[start:stop]
 
-        if self.augment:
-            signal, sample_id = self._apply_augmentation(signal, sample_id)
+        if signal.size(0) < self.num_samples:
+            signal = self._right_pad(signal)
+
+        signal = signal.to(self.device)
 
         return {
-            "input_values": signal.squeeze(),
-            "label": torch.tensor(label, dtype=torch.long),
-            "id": sample_id,
+            'input_values': signal,
+            'label': row['label'],
+            'id': row['name'],
+            'chunk_start': start_sec,
         }
 
+    def _get_audio_path(self, row):
+        path = row['path'].replace("\\", "/")
+        return os.path.join(self.audio_dir_file, path)
 
-    def _get_audio_sample_path(self, row):
-        return os.path.join(self.audio_dir, row["fold"], row["filename"])
-
-    def _get_id(self, row):
-        if "id" in row:
-            return str(row["id"])
-        return os.path.splitext(row["filename"])[0]
-
-
-    def _resample(self, signal: torch.Tensor, sr: int):
-        if sr != self.target_sample_rate:
-            resampler = torchaudio.transforms.Resample(sr, self.target_sample_rate)
-            signal = resampler(signal)
-        return signal
-
-    def _trim_or_pad(self, signal: torch.Tensor):
-        length = signal.shape[1]
-
-        if length > self.num_samples:
-            signal = signal[:, : self.num_samples]
-        else:
-            padding = self.num_samples - length
-            signal = torch.nn.functional.pad(signal, (0, padding))
-
-        return signal
-
-
-    def _apply_augmentation(self, signal: torch.Tensor, sample_id: str):
-        signal_np = signal.squeeze().cpu().numpy()
-
-        augmentations = []
-
-
-        if "low_pass" in self.aug_params:
-            params = self.aug_params["low_pass"]
-            augmentations.append(
-                LowPassFilter(
-                    min_cutoff_freq=params["min"],
-                    max_cutoff_freq=params["max"],
-                    p=params.get("p", 0.5),
-                )
-            )
-
-        if "noise" in self.aug_params:
-            params = self.aug_params["noise"]
-            augmentations.append(
-                AddGaussianNoise(
-                    min_amplitude=params["min"],
-                    max_amplitude=params["max"],
-                    p=params.get("p", 0.5),
-                )
-            )
-
-        if "time_stretch" in self.aug_params:
-            params = self.aug_params["time_stretch"]
-            augmentations.append(
-                TimeStretch(
-                    min_rate=params["min"],
-                    max_rate=params["max"],
-                    p=params.get("p", 0.5),
-                )
-            )
-
-        if "pitch_shift" in self.aug_params:
-            params = self.aug_params["pitch_shift"]
-            augmentations.append(
-                PitchShift(
-                    min_semitones=params["min"],
-                    max_semitones=params["max"],
-                    p=params.get("p", 0.5),
-                )
-            )
-
-        for aug in augmentations:
-            signal_np = aug(signal_np, sample_rate=self.target_sample_rate)
-
-        signal_tensor = torch.tensor(signal_np, dtype=torch.float32).unsqueeze(0)
-
-        return signal_tensor, sample_id + "_aug"
+    def _right_pad(self, signal):
+        missing = self.num_samples - signal.size(0)
+        return torch.nn.functional.pad(signal, (0, missing))

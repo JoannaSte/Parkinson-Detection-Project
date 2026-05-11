@@ -5,7 +5,7 @@ from pathlib import Path
 from fire import Fire
 
 from Trainer import Learner
-from create_dataloader2 import CreateDataloader
+from create_dataloader import CreateDataloader
 
 from torch.utils.data import DataLoader
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -49,19 +49,25 @@ def main(config_file: str):
         f"""
         ===== Experiment Config =====
         Dataset: {cfg['dataset']}
-        Augmentation: {cfg['augment']}
+        Task: {cfg['task_number']}
+        Fold: {cfg['fold']}
+        Processor: {cfg['processor']}
         =============================
         """
     )
 
     data_builder = CreateDataloader(
-        train_file=cfg["train_file"],
-        eval_file=cfg["eval_file"],
+        annotations_file=cfg["annotations_file"],
         audio_directory=cfg["audio_directory"],
+        task_number=cfg["task_number"],
+        fold=cfg["fold"],
+        processor=cfg["processor"],
         sample_rate=cfg["sample_rate"],
         num_samples=cfg["num_samples"],
-        augment=cfg["augment"],
-        aug_params=cfg.get("aug_params", {}),
+        device=cfg.get("device", "cpu"),
+        overlap=cfg.get("overlap", 0.0),
+        chunk_index=cfg.get("chunk_index", None),
+        skip_too_short=cfg.get("skip_too_short", True),
     )
 
     train_dataset = data_builder.create_train_dataset()
