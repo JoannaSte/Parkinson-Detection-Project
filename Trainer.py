@@ -23,7 +23,6 @@ class Learner(pl.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
 
-        # zapisuje hyperparametry do checkpointów
         self.save_hyperparameters(ignore=["model", "loss_fn"])
 
     def forward(self, input_values: torch.Tensor) -> torch.Tensor:
